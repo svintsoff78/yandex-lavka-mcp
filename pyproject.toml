@@ -25,6 +25,8 @@ yandex-lavka-mcp = "yandex_lavka_mcp.__main__:main"
 [project.optional-dependencies]
 browser = [
     "cryptography>=42.0",
+    # Headless 3-D Secure (threeds.py): runs the bank's page like the site's hidden iframe.
+    "playwright>=1.50,<2",
 ]
 # Remote HTTP deploy with OAuth (any OIDC provider) — see auth.py.
 server = [

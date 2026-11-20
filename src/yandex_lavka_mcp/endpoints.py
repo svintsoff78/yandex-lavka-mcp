@@ -39,16 +39,16 @@ DEFAULT_ENDPOINTS: dict[str, dict[str, str]] = {
     # Order history — CONFIRMED (captured 2026-08-25 from live traffic)
     "order_history": {"method": "GET", "path": "/api/v1/orders/v1/history/list"},
     "order_detail": {"method": "GET", "path": "/api/v1/orders/v1/history/{orderId}"},
-    "cancel_order": {"method": "POST", "path": "/api/v1/orders/{orderId}/cancel"},
+    "cancel_order": {"method": "POST", "path": "/api/v1/providers/orders/v1/cancel"},
     # Place order — CONFIRMED (captured 2026-07-19 from a real "Оплатить"). NOT
     # under /providers/. Submit returns {data:{orderId}} and triggers a charge on
     # the on-file card; payment then progresses via payments/v1/status and may
     # require 3-D Secure (status "wait_user_action" + redirectUrl).
-    "order_create": {"method": "POST", "path": "/api/v1/orders/submit"},
+    # Moved to /providers/orders/v2/submit (seen in the site bundle 2026-11-01;
+    # the old /api/v1/orders/submit answers 404). Body shape unchanged.
+    "order_create": {"method": "POST", "path": "/api/v1/providers/orders/v2/submit"},
     "payment_status": {"method": "POST", "path": "/api/v1/providers/payments/v1/status"},
     "payment_methods": {"method": "POST", "path": "/api/v1/providers/payments/v1/methods"},
-    # order_cancel path is dynamic (/api/v1/orders/{orderId}/cancel) — built in
-    # client.cancel_order, not via this registry.
 }
 
 

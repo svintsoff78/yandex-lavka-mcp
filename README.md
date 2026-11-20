@@ -54,10 +54,16 @@ refuses unless a preview was just run and you pass back the exact total it showe
 Change the cart and the preview is invalidated — you must preview again.
 
 **3-D Secure.** `confirm_order` submits the order and charges the on-file card,
-then polls payment status. If your bank requires 3-D Secure, `payment_status`
-comes back `wait_user_action` and a `redirect_url` is returned — open it to
-finish paying (a headless charge cannot complete 3DS). `cancel_order(order_id)`
-cancels.
+then polls payment status. Lavka almost always answers `wait_user_action` with a
+`redirect_url` first: the site then loads that page in a hidden iframe, the page
+sends browser data to the bank, and for a saved card the bank approves with no
+user input. The MCP does the same in headless Chrome (extra `browser`:
+`uv run --extra browser …`; it uses installed Chrome, else Playwright's
+Chromium) and returns `three_ds: "auto"` with the final status, ~10–20 s later.
+If the bank does want the user, or no browser is available, `payment_status`
+stays `wait_user_action` and `redirect_url` is returned — open it to finish
+paying. `YANDEX_LAVKA_MCP_AUTO_3DS=0` turns the headless step off.
+`cancel_order(order_id)` cancels.
 
 **Multiple locations / cities.** Catalog, prices and cart are location-scoped.
 `use_address("Дача")` switches to a saved address; `set_delivery_address("Казань,

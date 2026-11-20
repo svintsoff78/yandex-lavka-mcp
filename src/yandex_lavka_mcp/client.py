@@ -29,6 +29,7 @@ import httpx
 from .config import Config
 from .endpoints import resolve_base_url, resolve_endpoint
 from .errors import LavkaApiError, LavkaAuthError, LavkaConfigError
+from .threeds import auto_3ds_enabled, open_3ds_page
 
 _DEFAULT_HEADERS = {
     "Accept": "application/json",
@@ -46,6 +47,10 @@ _MAX_RETRIES = 2
 _RETRY_BACKOFF_SECONDS = 0.5
 _PRICE_TOLERANCE = 0.01  # RUB; drift beyond this between preview and submit aborts the order
 _CART_CONFLICT_RETRIES = 3  # re-read + retry on cartVersion 409 (shared-cart concurrency)
+# Payment states that end polling. "cancel" is what Lavka reports when the
+# charge was dropped (e.g. missing checkout headers).
+_PAYMENT_FINAL = ("success", "paid", "hold", "failed", "rejected", "cancel", "canceled", "cancelled")
+_THREEDS_POLL_ATTEMPTS = 45  # ~45 s with the browser open; frictionless 3DS took ~10 s in the HAR
 
 # The Lavka cart is ONE shared server-side resource per account. Serialize this
 # process's own cart writes so parallel tool calls don't self-collide on the
@@ -56,6 +61,12 @@ _CART_WRITE_LOCK = asyncio.Lock()
 # The anti-CSRF token Lavka's API requires is embedded in the homepage HTML:
 #   <script id="__page_props__-data" ...>{"csrfToken":"...", ...}</script>
 _CSRF_RE = re.compile(r'"csrfToken"\s*:\s*"([^"]+)"')
+# The site sends two tokens (seen in a HAR of a real checkout, 2026-11-01):
+# X-CSRF-Token = authProxyCsrfToken, X-CSRF-Token-Bff = csrfToken. It also sends
+# X-Grocery-Trusted-User from page props; without it the payment of a submitted
+# order came back "cancel".
+_AUTH_CSRF_RE = re.compile(r'"authProxyCsrfToken"\s*:\s*"([^"]+)"')
+_TRUSTED_RE = re.compile(r'"trustedUser"\s*:\s*(true|false)')
 
 
 def _pick(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -125,11 +136,15 @@ def _new_idempotency_token() -> str:
 class LavkaClient:
     """Async client. Use as an async context manager."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, *, threeds_opener=None) -> None:
         self._config = config
+        # Opens the 3-D Secure page in a headless browser; swappable in tests.
+        self._threeds_opener = threeds_opener or open_3ds_page
         self._base_url = resolve_base_url(config.base_url)
         self._client: httpx.AsyncClient | None = None
         self._csrf_token: str | None = None
+        self._auth_csrf_token: str | None = None
+        self._trusted_user: str | None = None
 
     async def __aenter__(self) -> "LavkaClient":
         headers = {**_DEFAULT_HEADERS, **self._config.headers}
@@ -180,8 +195,14 @@ class LavkaClient:
             "X-Captcha-Service": "lavka",
             "X-Captcha-Language": "ru",
         }
-        if self._csrf_token:
+        if self._auth_csrf_token:
+            headers["X-CSRF-Token"] = self._auth_csrf_token
+            if self._csrf_token:
+                headers["X-CSRF-Token-Bff"] = self._csrf_token
+        elif self._csrf_token:
             headers["X-CSRF-Token"] = self._csrf_token
+        if self._trusted_user:
+            headers["X-Grocery-Trusted-User"] = self._trusted_user
         return headers
 
     async def _ensure_csrf(self, *, force: bool = False) -> None:
@@ -198,6 +219,12 @@ class LavkaClient:
         match = _CSRF_RE.search(resp.text)
         if match:
             self._csrf_token = match.group(1)
+        auth = _AUTH_CSRF_RE.search(resp.text)
+        if auth:
+            self._auth_csrf_token = auth.group(1)
+        trusted = _TRUSTED_RE.search(resp.text)
+        if trusted:
+            self._trusted_user = trusted.group(1)
 
     async def _call(
         self,
@@ -925,7 +952,7 @@ class LavkaClient:
         *,
         confirmed_total: float | None = None,
         expected_cart_version: int | None = None,
-        poll: int = 6,
+        poll: int = 40,
     ) -> dict[str, Any]:
         """Submit the order (real charge on the on-file card) and poll payment.
 
@@ -999,12 +1026,50 @@ class LavkaClient:
         result: dict[str, Any] = {"order_id": order_id, "payment_status": None, "redirect_url": None}
         if poll:
             payment_state = await self._poll_payment(order_id, attempts=poll)
+            if payment_state.get("status") == "wait_user_action" and payment_state.get("redirect_url"):
+                payment_state = await self._finish_3ds(order_id, payment_state)
             result["payment_status"] = payment_state.get("status")
             result["redirect_url"] = payment_state.get("redirect_url")
+            if "three_ds" in payment_state:
+                result["three_ds"] = payment_state["three_ds"]
         return result
 
-    async def _poll_payment(self, order_id: str, *, attempts: int = 6) -> dict[str, Any]:
-        """Poll payment status; stop on a terminal/actionable state."""
+    async def _finish_3ds(self, order_id: str, state: dict[str, Any]) -> dict[str, Any]:
+        """Run the 3-D Secure page headlessly, as the site's hidden iframe does.
+
+        For a saved card the bank approves without user input; we keep the page
+        open while polling until the payment leaves ``wait_user_action``. If no
+        browser is available, or the bank does want the user (a real challenge),
+        the redirect URL is returned for the user to open.
+        """
+        url = state["redirect_url"]
+        if not auto_3ds_enabled():
+            return {**state, "three_ds": "disabled"}
+        user_agent = (self._client.headers.get("User-Agent") if self._client else None) or None
+        async with self._threeds_opener(url, self._config.cookies, user_agent=user_agent) as opened:
+            if not opened:
+                return {**state, "three_ds": "no_browser"}
+            final = await self._poll_payment(
+                order_id, attempts=_THREEDS_POLL_ATTEMPTS, until_final=True
+            )
+        if final.get("status") in _PAYMENT_FINAL:
+            return {"status": final.get("status"), "redirect_url": None, "three_ds": "auto"}
+        # Still waiting: the bank wants the user (code/push), or it's just slow.
+        return {
+            "status": final.get("status") or state.get("status"),
+            "redirect_url": final.get("redirect_url") or url,
+            "three_ds": "needs_user",
+        }
+
+    async def _poll_payment(
+        self, order_id: str, *, attempts: int = 6, until_final: bool = False
+    ) -> dict[str, Any]:
+        """Poll payment status; stop on a terminal/actionable state.
+
+        With ``until_final`` keep polling through ``wait_user_action`` (used
+        while the 3-D Secure page runs).
+        """
+        stop = _PAYMENT_FINAL if until_final else (*_PAYMENT_FINAL, "wait_user_action")
         status = None
         redirect = None
         for i in range(attempts):
@@ -1012,8 +1077,8 @@ class LavkaClient:
             data = raw if isinstance(raw, dict) else {}
             status = _pick(data, "status")
             payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
-            redirect = payload.get("redirectUrl")
-            if status in ("success", "paid", "hold", "wait_user_action", "failed", "rejected"):
+            redirect = payload.get("redirectUrl") or redirect
+            if status in stop:
                 break
             if i < attempts - 1:
                 await asyncio.sleep(_RETRY_BACKOFF_SECONDS * 2)
@@ -1021,7 +1086,7 @@ class LavkaClient:
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         """Cancel an order by id. Not retried: a cancel is a write."""
-        await self._call("cancel_order", {}, retry=False, path_params={"orderId": order_id})
+        await self._call("cancel_order", {"orderId": order_id}, retry=False)
         return {"order_id": order_id, "cancelled": True}
 
     # -- addresses / geo ---------------------------------------------------

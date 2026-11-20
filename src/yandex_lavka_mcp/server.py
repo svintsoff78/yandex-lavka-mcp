@@ -463,9 +463,10 @@ async def confirm_order(confirmed_total: float) -> dict[str, Any]:
     (same version and total). If anything drifted, nothing is charged and you
     must preview + confirm again.
 
-    Returns the order id and payment_status. "wait_user_action" means the bank
-    requires 3-D Secure — give the user redirect_url to finish paying.
-    cancel_order cancels.
+    Returns the order id and payment_status. 3-D Secure for a saved card is
+    finished automatically in a headless browser (three_ds: "auto"), like the
+    site does. If payment_status is still "wait_user_action", the bank wants the
+    user — give them redirect_url to finish paying. cancel_order cancels.
     """
     if not _LAST_PREVIEW:
         return _err(
@@ -508,8 +509,8 @@ async def confirm_order(confirmed_total: float) -> dict[str, Any]:
         note = None
         if status == "wait_user_action" and result.get("redirect_url"):
             note = (
-                "Order created but the bank requires 3-D Secure. Open redirect_url "
-                "to finish paying, or cancel_order to cancel."
+                "Order created but the bank requires 3-D Secure from the user. Open "
+                "redirect_url to finish paying, or cancel_order to cancel."
             )
         elif status not in ("success", "paid", "hold"):
             note = (

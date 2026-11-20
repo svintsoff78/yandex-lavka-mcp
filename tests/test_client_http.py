@@ -174,7 +174,7 @@ async def test_place_order_builds_submit_body_and_polls_payment():
     respx.get("https://lavka.yandex.ru/api/v1/providers/v2/service-info").mock(
         return_value=httpx.Response(200, json={"depotId": "1000000001"})
     )
-    submit = respx.post("https://lavka.yandex.ru/api/v1/orders/submit").mock(
+    submit = respx.post("https://lavka.yandex.ru/api/v1/providers/orders/v2/submit").mock(
         return_value=httpx.Response(200, json={"data": {"orderId": "ord-1-grocery"}})
     )
     respx.post("https://lavka.yandex.ru/api/v1/providers/payments/v1/status").mock(
@@ -187,12 +187,13 @@ async def test_place_order_builds_submit_body_and_polls_payment():
     cfg.context["placeId"] = "ymapsbm1://geo?data=Z"
     cfg.context["country"] = "Россия"
     cfg.context["additionalData"] = {"city": "Testville", "street": "Test Street", "house": "1", "flat": "10"}
-    async with LavkaClient(cfg) as client:
+    async with LavkaClient(cfg, threeds_opener=_no_browser) as client:
         result = await client.place_order(poll=1)
 
     assert result["order_id"] == "ord-1-grocery"
     assert result["payment_status"] == "wait_user_action"
     assert result["redirect_url"] == "https://3ds/x"
+    assert result["three_ds"] == "no_browser"
     body = json.loads(submit.calls.last.request.content)
     assert body["cartId"] == "c1"
     assert body["cartVersion"] == 3
@@ -279,7 +280,7 @@ async def test_place_order_errors_when_no_order_id():
     respx.get("https://lavka.yandex.ru/api/v1/providers/v2/service-info").mock(
         return_value=httpx.Response(200, json={"depotId": "1"})
     )
-    respx.post("https://lavka.yandex.ru/api/v1/orders/submit").mock(
+    respx.post("https://lavka.yandex.ru/api/v1/providers/orders/v2/submit").mock(
         return_value=httpx.Response(200, json={"data": {}})  # 200 but no orderId
     )
     async with LavkaClient(_config()) as client:
@@ -295,7 +296,7 @@ async def test_order_submit_is_not_retried():
     respx.get("https://lavka.yandex.ru/api/v1/providers/v2/service-info").mock(
         return_value=httpx.Response(200, json={"depotId": "1"})
     )
-    submit = respx.post("https://lavka.yandex.ru/api/v1/orders/submit").mock(
+    submit = respx.post("https://lavka.yandex.ru/api/v1/providers/orders/v2/submit").mock(
         side_effect=httpx.ConnectError("boom")
     )
     async with LavkaClient(_config()) as client:
@@ -402,7 +403,7 @@ async def test_place_order_uses_account_default_card_when_cart_has_none():
     respx.get("https://lavka.yandex.ru/api/v1/providers/v2/service-info").mock(
         return_value=httpx.Response(200, json={"depotId": "1"})
     )
-    submit = respx.post("https://lavka.yandex.ru/api/v1/orders/submit").mock(
+    submit = respx.post("https://lavka.yandex.ru/api/v1/providers/orders/v2/submit").mock(
         return_value=httpx.Response(200, json={"data": {"orderId": "ord"}})
     )
     async with LavkaClient(_config()) as client:
@@ -435,9 +436,9 @@ async def test_place_order_aborts_when_no_payment_method():
 
 
 @respx.mock
-async def test_cancel_order_posts_to_dynamic_path():
+async def test_cancel_order_posts_order_id():
     _mock_homepage()
-    route = respx.post("https://lavka.yandex.ru/api/v1/orders/ord-9-grocery/cancel").mock(
+    route = respx.post("https://lavka.yandex.ru/api/v1/providers/orders/v1/cancel").mock(
         return_value=httpx.Response(200, json={})
     )
     async with LavkaClient(_config()) as client:
@@ -556,7 +557,7 @@ async def test_get_order_quotes_the_id_and_shares_the_summary():
 @respx.mock
 async def test_cancel_order_refreshes_stale_csrf_and_is_not_retried():
     home = _mock_homepage()
-    route = respx.post("https://lavka.yandex.ru/api/v1/orders/ord-9-grocery/cancel").mock(
+    route = respx.post("https://lavka.yandex.ru/api/v1/providers/orders/v1/cancel").mock(
         side_effect=[httpx.Response(401), httpx.Response(200, json={})]
     )
     async with LavkaClient(_config()) as client:
@@ -568,7 +569,7 @@ async def test_cancel_order_refreshes_stale_csrf_and_is_not_retried():
 @respx.mock
 async def test_cancel_order_failure_is_an_error():
     _mock_homepage()
-    respx.post("https://lavka.yandex.ru/api/v1/orders/ord-9/cancel").mock(return_value=httpx.Response(409, json={}))
+    respx.post("https://lavka.yandex.ru/api/v1/providers/orders/v1/cancel").mock(return_value=httpx.Response(409, json={}))
     async with LavkaClient(_config()) as client:
         with pytest.raises(LavkaApiError, match="409"):
             await client.cancel_order("ord-9")
@@ -579,3 +580,139 @@ def test_base_body_has_no_is_supermarket():
     from yandex_lavka_mcp.config import Config
     body = LavkaClient(Config(context={"depotType": "supermarket"}))._base_body()
     assert body["depotType"] == "supermarket" and "is_supermarket" not in body
+
+
+@respx.mock
+async def test_headers_match_the_site_checkout():
+    # Captured from a real checkout HAR (2026-11-01): two CSRF tokens and the
+    # trusted-user flag, all from the homepage page props.
+    respx.get("https://lavka.yandex.ru/").mock(return_value=httpx.Response(
+        200,
+        text='<script>{"csrfToken":"bff-tok","authProxyCsrfToken":"auth-tok","trustedUser":true}</script>',
+    ))
+    route = respx.post("https://lavka.yandex.ru/api/v1/providers/cart/v1/retrieve").mock(
+        return_value=httpx.Response(200, json={"cartId": "c", "cartVersion": 1, "items": []})
+    )
+    async with LavkaClient(_config()) as client:
+        await client.get_cart()
+    sent = route.calls.last.request.headers
+    assert sent["X-CSRF-Token"] == "auth-tok"
+    assert sent["X-CSRF-Token-Bff"] == "bff-tok"
+    assert sent["X-Grocery-Trusted-User"] == "true"
+
+
+# -- 3-D Secure in a headless browser ------------------------------------------
+
+import contextlib
+
+
+@contextlib.asynccontextmanager
+async def _no_browser(url, cookies, *, user_agent=None):
+    yield False
+
+
+def _recording_browser(opened):
+    @contextlib.asynccontextmanager
+    async def opener(url, cookies, *, user_agent=None):
+        opened.append({"url": url, "cookies": dict(cookies), "ua": user_agent, "closed": False})
+        try:
+            yield True
+        finally:
+            opened[-1]["closed"] = True
+
+    return opener
+
+
+def _place_order_routes(statuses):
+    _mock_homepage()
+    _order_cart_route()
+    respx.get("https://lavka.yandex.ru/api/v1/providers/v2/service-info").mock(
+        return_value=httpx.Response(200, json={"depotId": "1"})
+    )
+    respx.post("https://lavka.yandex.ru/api/v1/providers/orders/v2/submit").mock(
+        return_value=httpx.Response(200, json={"data": {"orderId": "ord-3ds-grocery"}})
+    )
+    return respx.post("https://lavka.yandex.ru/api/v1/providers/payments/v1/status").mock(
+        side_effect=[
+            httpx.Response(200, json={"status": s, "payload": {"redirectUrl": "https://trust/3ds"}})
+            for s in statuses
+        ]
+    )
+
+
+@pytest.fixture
+def _fast_sleep(monkeypatch):
+    async def _sleep(_):
+        return None
+
+    monkeypatch.setattr("yandex_lavka_mcp.client.asyncio.sleep", _sleep)
+
+
+@respx.mock
+async def test_3ds_is_finished_in_headless_browser(_fast_sleep):
+    # Same sequence as the site's HAR: init → wait_user_action → success.
+    _place_order_routes(["init", "wait_user_action", "wait_user_action", "success"])
+    opened = []
+    async with LavkaClient(_config(), threeds_opener=_recording_browser(opened)) as client:
+        result = await client.place_order(poll=5)
+
+    assert result["payment_status"] == "success"
+    assert result["three_ds"] == "auto"
+    assert result["redirect_url"] is None
+    assert opened[0]["url"] == "https://trust/3ds"
+    assert opened[0]["cookies"] == {"Session_id": "fake"}
+    assert opened[0]["closed"] is True
+
+
+@respx.mock
+async def test_3ds_left_to_user_when_bank_keeps_waiting(_fast_sleep, monkeypatch):
+    monkeypatch.setattr("yandex_lavka_mcp.client._THREEDS_POLL_ATTEMPTS", 3)
+    _place_order_routes(["wait_user_action"] * 4)
+    opened = []
+    async with LavkaClient(_config(), threeds_opener=_recording_browser(opened)) as client:
+        result = await client.place_order(poll=5)
+
+    assert result["payment_status"] == "wait_user_action"
+    assert result["three_ds"] == "needs_user"
+    assert result["redirect_url"] == "https://trust/3ds"
+    assert opened[0]["closed"] is True
+
+
+@respx.mock
+async def test_3ds_cancel_stops_polling(_fast_sleep):
+    status = _place_order_routes(["wait_user_action", "cancel"])
+    async with LavkaClient(_config(), threeds_opener=_recording_browser([])) as client:
+        result = await client.place_order(poll=5)
+
+    assert result["payment_status"] == "cancel"
+    assert status.call_count == 2
+
+
+@respx.mock
+async def test_3ds_can_be_turned_off(_fast_sleep, monkeypatch):
+    monkeypatch.setenv("YANDEX_LAVKA_MCP_AUTO_3DS", "0")
+    _place_order_routes(["wait_user_action"])
+    opened = []
+    async with LavkaClient(_config(), threeds_opener=_recording_browser(opened)) as client:
+        result = await client.place_order(poll=5)
+
+    assert result["three_ds"] == "disabled"
+    assert result["redirect_url"] == "https://trust/3ds"
+    assert opened == []
+
+
+async def test_open_3ds_page_without_playwright_yields_false(monkeypatch):
+    import builtins
+
+    from yandex_lavka_mcp.threeds import open_3ds_page
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name.startswith("playwright"):
+            raise ImportError(name)
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    async with open_3ds_page("https://trust/3ds", {"Session_id": "x"}) as opened:
+        assert opened is False
